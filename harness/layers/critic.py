@@ -79,16 +79,93 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not claims or not isinstance(claims, list):
+            return report
+
+        new_claims = []
+        split_conflict = False
+        docs = ctx.corpus.docs if ctx.corpus is not None else []
+        observed = ctx.observed_text
+
+        for claim in claims:
+            text = claim.get("text", "")
+            if not text:
+                continue
+                
+            # 1. Exact match on a single line
+            exact_match = False
+            for doc in docs:
+                if doc.body in observed and any(text in line for line in doc.body.split("\n")):
+                    exact_match = True
+                    break
+            if exact_match:
+                new_claims.append(claim)
+                continue
+            
+            # 2. Try to split " và " conflict
+            cursor = 0
+            pair = None
+            split_conflict_found = False
+            while True:
+                cut = text.find(" và ", cursor)
+                if cut < 0:
+                    break
+                left = text[:cut].strip()
+                right = text[cut + len(" và "):].strip()
+                
+                if left and right:
+                    left_docs = [d for d in docs if d.body in observed and any(left in line for line in d.body.split("\n"))]
+                    right_docs = [d for d in docs if d.body in observed and any(right in line for line in d.body.split("\n"))]
+                    pair = next(
+                        ((a, b) for a in left_docs for b in right_docs
+                         if a.doc_id != b.doc_id),
+                        None,
+                    )
+                if pair is not None:
+                    new_claims.extend([
+                        {"text": left, "doc_id": pair[0].doc_id},
+                        {"text": right, "doc_id": pair[1].doc_id},
+                    ])
+                    split_conflict = True
+                    split_conflict_found = True
+                    break
+                cursor = cut + 1
+                
+            if split_conflict_found:
+                continue
+                
+            # 3. Substring Salvager: Cứu các chuỗi bị thêm thắt bằng cách cắt bớt
+            best_sub = ""
+            best_doc = None
+            for doc in docs:
+                if doc.body not in observed:
+                    continue
+                for line in doc.body.split("\n"):
+                    for i in range(len(text)):
+                        for j in range(i + len(best_sub) + 1, len(text) + 1):
+                            sub = text[i:j]
+                            if sub in line:
+                                if len(sub) > len(best_sub):
+                                    best_sub = sub
+                                    best_doc = doc.doc_id
+                            else:
+                                break
+            
+            if len(best_sub) > 15:
+                claim["text"] = best_sub
+                if best_doc:
+                    claim["doc_id"] = best_doc
+                new_claims.append(claim)
+
+        report["claims"] = new_claims
+        if split_conflict:
+            report["abstain"] = True
+        if not new_claims:
+            report["abstain"] = True
+            report["citations"] = []
+            report["answer"] = "Không đủ bằng chứng."
+        else:
+            report["citations"] = sorted(list({c.get("doc_id") for c in new_claims if isinstance(c.get("doc_id"), str)}))
+            
+        return report
